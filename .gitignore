@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.env
+.env.*
+.venv/
+venv/
+build/
+dist/
+*.log
+
+# macOS
+.DS_Store
+
+# Jupyter and others
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# Audio / Models
+*.wav
+*.mp3
+*.mp4
+*.pt
+*.bin
+*.onnx
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
