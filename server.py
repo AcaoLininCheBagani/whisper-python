@@ -93,7 +93,7 @@ async def llm_endpoint(request: Request):
             ollama_response = await client.post(
                 "http://localhost:11434/api/generate",
                 json={
-                    "model": "llama3.1:8b",      # ← You can change this!
+                    "model": "llama3.2:1b",      # ← You can change this!
                     "prompt": prompt,
                     "stream": False,
                     "options": {
