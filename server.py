@@ -119,3 +119,5 @@ async def llm_endpoint(request: Request):
     except Exception as e:
         print(f"LLM endpoint error: {e}")
         raise HTTPException(status_code=500, detail=f"LLM processing failed: {str(e)}")
+    
+# source venv/bin/activate
