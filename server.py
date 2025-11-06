@@ -1,6 +1,6 @@
 # server.py
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
@@ -12,6 +12,9 @@ import tempfile
 import os
 import httpx
 import json
+import asyncio
+import uuid
+import edge_tts
 
 # >>> ADD MOTOR & DOTENV <<<
 from dotenv import load_dotenv
@@ -197,3 +200,41 @@ Response:
         "text": spoken_response,
         "raw_llm": raw_llm
     })
+    
+@app.post("/tts")
+async def text_to_speech(request: Request):
+    body = await request.json()
+    text = body.get("text", "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text input is required")
+
+    voice = body.get("voice", "en-AU-WilliamNeural")  # Default to your preferred voice
+    valid_voices = ['en-AU-NatashaNeural', 'en-AU-WilliamNeural']
+    if voice not in valid_voices:
+        voice = "en-AU-WilliamNeural"
+
+    # Generate unique filename
+    filename = f"tts_{uuid.uuid4().hex}.mp3"
+    output_path = os.path.join(tempfile.gettempdir(), filename)
+
+    try:
+        # Run edge_tts asynchronously
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(output_path)
+
+        # Return the file path (client can fetch it via /audio/{filename} if needed)
+        return JSONResponse({
+            "message": "Audio generated successfully",
+            "audio_file": filename,  # Just the filename for reference
+            "path": output_path       # Full path if server needs to serve it
+        })
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS generation failed: {str(e)}")
+    
+@app.get("/audio/{filename}")
+async def serve_audio(filename: str):
+    path = os.path.join(tempfile.gettempdir(), filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(path, media_type="audio/mpeg")
