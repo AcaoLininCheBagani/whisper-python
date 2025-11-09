@@ -4,10 +4,15 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from pydantic import BaseModel
-from datetime import datetime, timezone  # ⚠️ you had 'datatime' typo!
-# from piper import text_to_speech
-# audio_path = text_to_speech(spoken_response)
-
+from datetime import datetime, timezone, timedelta
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from typing import List, Optional
+from langchain_ollama import OllamaLLM
+from rag_functions import build_context_from_todos, is_date_query, is_yesterday, get_user_intent, get_todos_created_yesterday, get_todos_created_today, find_similar_todos_mongodb
+from mongo_connection import db
+import re
+import numpy as np
 import tempfile
 import os
 import httpx
@@ -16,22 +21,34 @@ import asyncio
 import uuid
 import edge_tts
 
-# >>> ADD MOTOR & DOTENV <<<
+# MongoDB & Environment
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from bson import ObjectId  # Add this import
 
-load_dotenv()  # Load .env file
+embModel = SentenceTransformer('all-MiniLM-L6-v2')
 
-# MongoDB setup
-MONGO_URI = os.getenv("MONGO_URI")
-if not MONGO_URI:
-    raise RuntimeError("MONGO_URI not set in environment")
+# Custom JSON encoder for ObjectId
+class JSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 
-client = AsyncIOMotorClient(MONGO_URI)
-db = client.track_my_todo  # your DB name
+# Todo item schema
+class TodoItem(BaseModel):
+    title: str
+    completed: bool = False
+    priority: str = "medium"
+
+class TodoItemWithEmbedding(TodoItem):
+    embedding: Optional[List[float]] = None
 
 # FastAPI app
 app = FastAPI(title="Voice Todo API")
+llm = OllamaLLM(model="llama3.2:1b")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +57,137 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Helper function to serialize MongoDB documents
+def serialize_todo(todo):
+    """Convert MongoDB document to JSON-serializable dict"""
+    if todo is None:
+        return None
+    
+    serialized = {}
+    for key, value in todo.items():
+        if isinstance(value, ObjectId):
+            serialized[key] = str(value)
+        elif isinstance(value, datetime):
+            serialized[key] = value.isoformat()
+        else:
+            serialized[key] = value
+    return serialized
+
+# API Routes
+@app.post("/todos")
+async def create_todo(todo: TodoItem):
+    try:
+        embedding = embModel.encode([todo.title])[0].tolist()
+        todo_document = {
+            "title": todo.title,
+            "completed": todo.completed,
+            "priority": todo.priority,
+            "embedding": embedding,
+            "createdAt": datetime.now(),
+            "updatedAt": datetime.now()
+        }
+
+        result = await db.todos.insert_one(todo_document)
+        if result:
+            return {
+                "message": "Successfully created todo"
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Error creating todo")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating todo: {str(e)}")
+
+# --- RAG IMPLEMENTATION WITH MONGODB VECTOR SEARCH ---
+@app.post("/llm")
+async def handle_llm(request: Request):
+    body = await request.json()
+    text = body.get("text", "").strip()
+    
+    if not text:
+        raise HTTPException(status_code=400, detail="Text input is required")
+    
+    intent = get_user_intent(text)
+    try:
+        if intent:
+            query_embedding = embModel.encode([text])[0].tolist()
+            if intent == 'add':
+                todos = await get_todos_created_today()
+#                 enhanced_prompt = f"""You are a task extractor. Remove unnecessary words like "add". from the following text and return only the core task.
+
+# Text: {text}
+
+# Return only the cleaned text without any additional explanation."""
+            enhanced_prompt = f"""You are a task extraction assistant. Analyze the input text and extract only the core actionable task by:
+
+            1. Removing all request phrases like "can you", "please", "add", "I need you to", etc.
+            2. Eliminating unnecessary filler words and polite modifiers
+            3. Keeping only the essential action + object combination
+            4. Ensuring the output is concise and direct
+            5. Removing any question formatting or conversational markers
+
+            Input text: {text}
+
+            Return ONLY the cleaned task text with no additional explanations, quotes, or formatting."""
+        elif is_date_query(text):
+            todos = await get_todos_created_today()
+            context = build_context_from_todos(todos)
+            enhanced_prompt = f"""
+            The user is asking about todos created today. Here are their todos created today:
+            
+            TODAY'S TODOS:
+            {context}
+            
+            USER QUERY: {text}
+            
+            Provide a helpful response about what they created today.
+            If there are no todos today, suggest creating some.
+            
+            RESPONSE:
+            """
+        elif is_yesterday(text):
+            todos = await get_todos_created_yesterday()
+            context = build_context_from_todos(todos)
+            enhanced_prompt = f""" 
+            The user is asking about todos created yesterday
+            YESTERDAY'S TODOS:
+            {context}
+            
+            can you respond on what todos the user created yesterday based on the context? {text}
+            RESPONSE:
+            """
+        else:
+            # Step 1: Generate embedding for the query
+            query_embedding = embModel.encode([text])[0].tolist()
+            
+            # Step 2: Find similar todos using MongoDB vector search
+            todos = await find_similar_todos_mongodb(query_embedding, top_k=3)
+            
+            # Step 3: Build context from similar todos
+            context = build_context_from_todos(todos)
+            
+            # Step 4: Create enhanced prompt with context
+            enhanced_prompt = f"""
+            Answer the question based only on the following context:
+            {context}
+
+            ---
+            Answer the question based on the above context: {text}.
+            """
+        
+        # Step 5: Invoke LLM with enhanced prompt
+        result = llm.invoke(enhanced_prompt)
+        
+        return JSONResponse({ 
+            "message": result,
+            "relevant_todos": todos,
+            "query_type": "date_based" if is_date_query(text) | is_yesterday(text) else "semantic_search"
+        })
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing LLM request: {str(e)}")
+
+
 
 # Load Whisper
 print("🚀 Loading Whisper model...")
@@ -71,136 +219,6 @@ async def transcribe(file: UploadFile = File(...)):
     finally:
         if 'tmp_path' in locals():
             os.unlink(tmp_path)
-
-# --- UPGRADED /llm: Reasoning Agent with MongoDB ---
-# --- /llm: REASONING AGENT ---
-@app.post("/llm")
-async def llm_endpoint(request: Request):
-    body = await request.json()
-    user_input = body.get("text", "").strip()
-    if not user_input:
-        raise HTTPException(status_code=400, detail="Text input is required")
-
-    # Fetch current todos (your schema uses 'title')
-    try:
-        todos = await db.todos.find(
-           
-        ).to_list(length=50)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {str(e)}")
-
-    # === 🔍 QUICK RULE: Handle questions WITHOUT LLM ===
-    user_lower = user_input.lower()
-    question_keywords = ["what", "list", "show", "tell me", "do i have", "anything to do", "my tasks", "todo"]
-    is_question = any(kw in user_lower for kw in question_keywords)
-
-    if is_question:
-        if not todos:
-            response = "Your todo list is empty."
-        else:
-            total = len(todos)
-            pending = [t for t in todos if not t["completed"]]
-            response = f"You have {len(pending)} pending tasks."
-            # Mention a high-priority one
-            high_priority = next((t for t in pending if t.get("priority") == "high"), None)
-            if high_priority:
-                response += f" Start with: {high_priority['title']}."
-        return JSONResponse({"text": response, "raw_llm": "(handled by rule)"})
-
-    # === 🧠 OTHERWISE: Use LLM for command parsing ===
-    todo_summary = "\n".join([
-        f"- [{'✓' if t['completed'] else ' '}] {t['title']} (priority: {t.get('priority', 'normal')})"
-        for t in todos
-    ]) or "No tasks."
-
-    prompt = f"""
-You are JARVIS, a precise assistant. Today is {datetime.now().strftime('%Y-%m-%d')}.
-Current todos:
-{todo_summary}
-
-User said: "{user_input}"
-
-Rules:
-- If the user gives a clear command to add, complete, or delete a task, respond ONLY with valid JSON.
-- The JSON must have two keys: "action" and "item".
-- "action" must be exactly one of: "add", "complete", or "delete".
-- "item" must be the exact task phrase from the user (no extra words).
-- NEVER include explanations, markdown, or placeholders like "add|delete".
-- If unsure, respond naturally in under 15 words.
-
-Examples of GOOD output:
-User: add buy milk
-Response: {{"action": "add", "item": "buy milk"}}
-
-User: complete write report
-Response: {{"action": "complete", "item": "write report"}}
-
-User: delete old meeting notes
-Response: {{"action": "delete", "item": "old meeting notes"}}
-
-Now respond to this input:
-User: "{user_input}"
-Response:
-""".strip()
-
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as ollama:
-            resp = await ollama.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "llama3.2:1b",
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.1, "num_ctx": 1024}
-                }
-            )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Ollama error: {resp.text}")
-        raw_llm = resp.json().get("response", "").strip()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
-
-    # === 🔄 Execute action or return text ===
-    spoken_response = raw_llm
-    try:
-        # Clean potential markdown
-        clean_json = raw_llm.replace("```json", "").replace("```", "").strip()
-        action_data = json.loads(clean_json)
-        action = action_data.get("action")
-        item = action_data.get("item")
-
-        if action == "add" and item:
-            await db.todos.insert_one({
-                "title": item,
-                "completed": False,
-                "priority": "normal",
-                "createdAt": datetime.now(timezone.utc),
-                "updatedAt": datetime.now(timezone.utc)
-            })
-            spoken_response = f"Added: {item}"
-
-        elif action == "complete" and item:
-            result = await db.todos.update_one(
-                {"title": {"$regex": item, "$options": "i"}},
-                {"$set": {"completed": True, "updatedAt": datetime.now(timezone.utc)}}
-            )
-            spoken_response = "Marked as done." if result.modified_count else "Task not found."
-
-        elif action == "delete" and item:
-            result = await db.todos.delete_one(
-                {"title": {"$regex": item, "$options": "i"}}
-            )
-            spoken_response = "Deleted." if result.deleted_count else "Task not found."
-
-    except (json.JSONDecodeError, KeyError, TypeError):
-        # Not a valid action → treat as natural response
-        pass
-
-    return JSONResponse({
-        "text": spoken_response,
-        "raw_llm": raw_llm
-    })
-    
 @app.post("/tts")
 async def text_to_speech(request: Request):
     body = await request.json()
